@@ -1,0 +1,107 @@
+services:
+  postgres_db:
+    image: postgres:15-alpine
+    container_name: shopzada_dwh_db
+    environment:
+      POSTGRES_USER: shopzada_user
+      POSTGRES_PASSWORD: root
+      POSTGRES_DB: shopzada_dwh
+    ports:
+      - "15432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shopzada_user -d shopzada_dwh"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  bronze_ingestion:
+    build:
+      context: ../
+      dockerfile: scripts/bronze/Dockerfile
+    container_name: shopzada_bronze_ingester
+    volumes:
+      - ../scripts/data/source:/app/source_data:ro
+      - ../scripts/data/landing:/app/data_zone
+    command: [
+      "python", "modded_bronzeval.py",
+      "--source-data", "/app/source_data",
+      "--landing-zone", "/app/data_zone"
+    ]
+    depends_on:
+      postgres_db:
+        condition: service_healthy
+
+  silver_transformation:
+    build:
+      context: ../
+      dockerfile: scripts/silver/Dockerfile
+    container_name: shopzada_silver_transformer
+    volumes:
+      - ../scripts/data/landing:/app/data_zone
+    command: [
+      "python", "modded_silverval.py",
+      "--data-zone", "/app/data_zone"
+    ]
+    depends_on:
+      bronze_ingestion:
+        condition: service_completed_successfully
+
+  gold_load:
+    build:
+      context: ../
+      dockerfile: scripts/gold/Dockerfile # Path to the new Dockerfile
+    container_name: shopzada_gold_loader
+    volumes:
+      - ../scripts/data/landing:/app/data_zone # Map to get Silver files
+    command: [
+      "python", "modded_goldload.py",
+    ]
+    depends_on:
+      # Must wait for Silver to finish, as it creates the input files
+      silver_transformation:
+        condition: service_completed_successfully
+      # Must wait for the DB to be ready, as it connects to load data
+      postgres_db:
+        condition: service_healthy
+  
+
+# === NEW PGADMIN SERVICE ADDED HERE ===
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: shopzada_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@shopzada.com
+      PGADMIN_DEFAULT_PASSWORD: pgadmin_password
+    ports:
+      - "5050:80" # Maps host port 5050 to container port 80
+    depends_on:
+      - postgres_db
+# ======================================
+
+  airflow:
+    build:
+      context: ../workflows
+    container_name: shopzada_airflow
+    environment:
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    volumes:
+      - ../workflows:/opt/airflow/dags
+      - ../scripts/data:/app/scripts/data
+    ports:
+      - "8080:8080"
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow users create --username admin --firstname Admin --lastname User --password admin --role Admin --email admin@example.com || true &&
+        airflow webserver &
+        airflow scheduler
+      "
+    depends_on:
+      postgres_db:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
